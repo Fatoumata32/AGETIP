@@ -1,18 +1,38 @@
-import { useEffect, useMemo, useState, type FormEvent } from 'react'
+import { useEffect, useMemo, useState, type ChangeEvent, type FormEvent } from 'react'
 import {
   AirVent, AlertTriangle, ArrowDownToLine, Bell, BookOpenText, Boxes, CalendarDays,
   Check, CheckCheck, ChevronDown, ChevronRight, CloudUpload, Computer, FileChartColumn, FileText,
-  Filter, Home, LogOut, Menu, Monitor, Pencil, Plus, Printer, Search, Settings, ShieldCheck, UserRound,
+  Filter, Home, LogOut, Menu, Monitor, Pencil, Plus, Printer, Search, Settings, ShieldCheck, UserRound, UsersRound,
   Snowflake, Sparkles, Upload, Wrench, X,
 } from 'lucide-react'
 import { initialIncidents, incidentTypes, modules, type Incident, type ModuleName, type ReportFormat } from './types'
+import { apiRequest, askLocalAssistant, getApiBaseUrl } from './lib/persistence'
+import { supabase } from './lib/supabase'
+import {
+  deleteReferenceDocument,
+  emptyOperationalData,
+  findDocumentContext,
+  importLocalWorkspaceData,
+  loadReferenceDocuments,
+  loadWorkspaceData,
+  loadUserRecord,
+  saveUserRecord,
+  saveIncidents as saveIncidentsToSupabase,
+  saveOperationalModule as saveOperationalModuleToSupabase,
+  saveTonerMovements as saveTonerMovementsToSupabase,
+  uploadReferenceDocument,
+  type ReferenceDocument,
+} from './lib/supabaseData'
+import { extractReferenceText } from './lib/documentText'
+import type { Session } from '@supabase/supabase-js'
 import type { ReportSection } from './reportTypes'
 import { analyzeReport, type ReportAnalysis } from './reportAnalysis'
 import { printIncidentSheet } from './incidentPrint'
 import InvoiceImportDialog from './InvoiceImportDialog'
 import { invoicePeriodKey, invoicePeriodLabel, type InvoiceImportCandidate } from './invoiceImport'
+import PersonnelDirectory from './PersonnelDirectory'
 
-type Section = 'Tableau de bord' | ModuleName | 'Rapports' | 'Assistant IA' | 'Documents et outils' | 'Paramètres'
+type Section = 'Tableau de bord' | ModuleName | 'Personnel' | 'Rapports' | 'Assistant IA' | 'Documents et outils' | 'Paramètres'
 type ReportType = 'Rapport général' | 'Factures SONATEL' | 'Incidents' | 'Cartouches (stock)' | 'Parc informatique' | 'Climatiseurs' | 'Maintenances' | 'Rapport consolidé'
 type Frequency = 'Journalier' | 'Hebdomadaire' | 'Mensuel' | 'Trimestriel' | 'Semestriel' | 'Annuel' | 'Période personnalisée'
 type EditableRecord = { reference: string; designation: string } & Record<string, string>
@@ -87,6 +107,7 @@ function localDateValue(date = new Date()) {
 const navGroups = [
   { label: '', items: [{ name: 'Tableau de bord' as Section, icon: Home }] },
   { label: 'Modules', items: [
+    { name: 'Personnel' as Section, icon: UsersRound },
     { name: 'Factures SONATEL' as Section, icon: FileText },
     { name: 'Incidents' as Section, icon: AlertTriangle },
     { name: 'Cartouches (stock)' as Section, icon: Boxes },
@@ -223,7 +244,9 @@ function periodRange(frequency: Frequency, reference: string, customStart: strin
   return { start: start.toISOString().slice(0, 10), end: end.toISOString().slice(0, 10) }
 }
 
-function App() {
+function Workspace({ session }: { session: Session | null }) {
+  const isRemote = Boolean(session && supabase)
+  const [dataReady, setDataReady] = useState(!isRemote)
   const [section, setSection] = useState<Section>('Tableau de bord')
   const [incidents, setIncidents] = useState<Incident[]>(readStoredIncidents)
   const [operationalRecords, setOperationalRecords] = useState<Record<ModuleName, EditableRecord[]>>(readStoredOperationalRecords)
@@ -231,8 +254,20 @@ function App() {
   const [selectedIncident, setSelectedIncident] = useState<Incident | null>(null)
   const [recordEditor, setRecordEditor] = useState<RecordEditorState | null>(null)
   const [invoiceImportOpen, setInvoiceImportOpen] = useState(false)
-  const [profile, setProfile] = useState<UserProfile>(readStoredProfile)
-  const [profileDraft, setProfileDraft] = useState<UserProfile>(readStoredProfile)
+  const [profile, setProfile] = useState<UserProfile>(() => session
+    ? {
+        name: String(session.user.user_metadata.display_name ?? session.user.email ?? defaultProfile.name),
+        email: session.user.email ?? '',
+        jobTitle: 'Utilisateur connecté',
+      }
+    : readStoredProfile())
+  const [profileDraft, setProfileDraft] = useState<UserProfile>(() => session
+    ? {
+        name: String(session.user.user_metadata.display_name ?? session.user.email ?? defaultProfile.name),
+        email: session.user.email ?? '',
+        jobTitle: 'Utilisateur connecté',
+      }
+    : readStoredProfile())
   const [profileOpen, setProfileOpen] = useState(false)
   const [logoutConfirm, setLogoutConfirm] = useState(false)
   const [notificationsOpen, setNotificationsOpen] = useState(false)
@@ -253,12 +288,152 @@ function App() {
   const [reportFormat, setReportFormat] = useState<ReportFormat>('PDF')
   const [search, setSearch] = useState('')
   const [notice, setNotice] = useState('')
+  const [localMigrationRunning, setLocalMigrationRunning] = useState(false)
   const [drawerOpen, setDrawerOpen] = useState(false)
   const [stockTab, setStockTab] = useState<'Stock' | 'Mouvements de cartouches'>('Stock')
-  const [chat, setChat] = useState<{ role: 'assistant' | 'user'; text: string }[]>([
-    { role: 'assistant', text: 'Bonjour ! Je suis l’assistant AGETIP. Je peux vous aider à retrouver les procédures et les informations de votre parc. Connectez une base documentaire locale pour activer les réponses avec sources.' },
+  const [chat, setChat] = useState<{ role: 'assistant' | 'user'; text: string; sources?: string[] }[]>([
+    { role: 'assistant', text: 'Bonjour ! Je suis l’assistant AGETIP. Posez une question sur les documents de référence chargés ou demandez une aide générale.' },
   ])
   const [chatInput, setChatInput] = useState('')
+  const [assistantLoading, setAssistantLoading] = useState(false)
+  const [assistantStatus, setAssistantStatus] = useState('Vérification du serveur…')
+
+  useEffect(() => {
+    let active = true
+    void fetch(`${getApiBaseUrl()}/assistant/health`)
+      .then(async response => {
+        const result = await response.json() as { payload?: { message?: string } }
+        if (active) setAssistantStatus(result.payload?.message ?? (response.ok ? 'Ollama prêt.' : 'Ollama indisponible.'))
+      })
+      .catch(error => {
+        console.warn('Le service local de l’assistant est inaccessible.', error)
+        if (active) setAssistantStatus('Backend assistant inaccessible.')
+      })
+    return () => { active = false }
+  }, [])
+
+  useEffect(() => {
+    if (!isRemote || !session) return
+    let active = true
+    void supabase!.from('user_profiles')
+      .select('display_name, role')
+      .eq('id', session.user.id)
+      .maybeSingle()
+      .then(({ data, error }) => {
+        if (!active) return
+        if (error) {
+          console.error('Impossible de charger le profil Supabase.', error)
+          showNotice('Impossible de charger votre rôle Supabase.')
+          return
+        }
+        const roleLabels: Record<string, string> = {
+          admin: 'Administrateur',
+          technician: 'Technicien',
+          finance: 'Finance',
+          reader: 'Lecture seule',
+        }
+        const updated = {
+          name: data?.display_name || String(session.user.user_metadata.display_name ?? session.user.email ?? defaultProfile.name),
+          email: session.user.email ?? '',
+          jobTitle: roleLabels[data?.role ?? 'reader'] ?? 'Lecture seule',
+        }
+        setProfile(updated)
+        setProfileDraft(updated)
+      })
+    return () => { active = false }
+  }, [isRemote, session])
+
+  useEffect(() => {
+    if (!isRemote || !session) return
+    let active = true
+    void loadUserRecord<{ seen?: string[] }>('notification_preferences', session.user.id)
+      .then(record => {
+        if (active && Array.isArray(record?.seen)) setSeenNotifications(record.seen)
+      })
+      .catch(error => {
+        console.error('Impossible de charger les préférences de notifications.', error)
+        if (active) showNotice('Impossible de charger les notifications mémorisées.')
+      })
+    return () => { active = false }
+  }, [isRemote, session?.user.id])
+
+  useEffect(() => {
+    if (isRemote) return
+    try {
+      const saved = JSON.parse(localStorage.getItem('agetip-assistant-chat') ?? '[]') as unknown
+      if (Array.isArray(saved) && saved.every(item => item && typeof item === 'object' && typeof item.text === 'string')) {
+        if (saved.length) setChat(saved as typeof chat)
+      }
+    } catch (error) {
+      console.error('L’historique local de l’assistant est illisible.', error)
+    }
+  }, [isRemote])
+
+  useEffect(() => {
+    if (!isRemote || !session) return
+    let active = true
+    void loadUserRecord<{ messages?: Array<{ role: 'assistant' | 'user'; text: string; sources?: string[] }> }>(
+      'assistant_chat',
+      session.user.id,
+    ).then(record => {
+      if (active && Array.isArray(record?.messages) && record.messages.length) setChat(record.messages)
+    }).catch(error => {
+      console.error('Impossible de charger l’historique de l’assistant.', error)
+      if (active) showNotice('Impossible de charger l’historique de l’assistant.')
+    })
+    return () => { active = false }
+  }, [isRemote, session?.user.id])
+
+  useEffect(() => {
+    let active = true
+    const hydrateWorkspace = async () => {
+      if (isRemote) {
+        try {
+          const workspace = await loadWorkspaceData()
+          if (!active) return
+          setIncidents(workspace.incidents)
+          setOperationalRecords(workspace.operationalRecords)
+          setTonerMovements(workspace.tonerMovements)
+          setDataReady(true)
+          return
+        } catch (error) {
+          console.error('Impossible de charger les données depuis Supabase.', error)
+          if (active) {
+            setIncidents([])
+            setOperationalRecords(emptyOperationalData())
+            setTonerMovements([])
+            setDataReady(true)
+            showNotice('Impossible de charger les données Supabase. Vérifiez votre rôle et la migration app_records.')
+          }
+          return
+        }
+      }
+
+      const [backendIncidents, backendRecords, backendMovements] = await Promise.all([
+        apiRequest<Incident[]>('/incidents'),
+        apiRequest<Record<ModuleName, EditableRecord[]>>('/operational-records'),
+        apiRequest<EditableRecord[]>('/toner-movements'),
+      ])
+
+      if (active && backendIncidents) {
+        setIncidents(backendIncidents)
+        localStorage.setItem('agetip-incidents', JSON.stringify(backendIncidents))
+      }
+
+      if (active && backendRecords) {
+        setOperationalRecords(backendRecords)
+        localStorage.setItem('agetip-operational-records', JSON.stringify(backendRecords))
+      }
+
+      if (active && backendMovements) {
+        setTonerMovements(backendMovements)
+        localStorage.setItem('agetip-toner-movements', JSON.stringify(backendMovements))
+      }
+    }
+
+    void hydrateWorkspace()
+    return () => { active = false }
+  }, [isRemote, session?.user.id])
 
   useEffect(() => {
     const dismissOnEscape = (event: KeyboardEvent) => {
@@ -318,29 +493,63 @@ function App() {
     window.setTimeout(() => setNotice(''), 3500)
   }
 
-  function markNotificationsSeen(ids: string[]) {
+  async function markNotificationsSeen(ids: string[]) {
     const updated = [...new Set([...seenNotifications, ...ids])]
+    if (isRemote && session) {
+      try {
+        await saveUserRecord('notification_preferences', session.user.id, { seen: updated })
+      } catch (error) {
+        console.error('Impossible d’enregistrer les préférences Supabase de notifications.', error)
+        showNotice('Impossible de mémoriser les notifications comme lues.')
+        return
+      }
+    }
+
     try {
       localStorage.setItem('agetip-seen-notifications', JSON.stringify(updated))
-      setSeenNotifications(updated)
     } catch (error) {
       console.error('Impossible d’enregistrer les préférences de notifications.', error)
-      showNotice('Impossible de mémoriser les notifications comme lues.')
+    }
+    setSeenNotifications(updated)
+  }
+
+  async function migrateLocalData() {
+    if (!session || localMigrationRunning) return
+    setLocalMigrationRunning(true)
+    try {
+      const result = await importLocalWorkspaceData(session.user.id)
+      const workspace = await loadWorkspaceData()
+      setIncidents(workspace.incidents)
+      setOperationalRecords(workspace.operationalRecords)
+      setTonerMovements(workspace.tonerMovements)
+      showNotice(`${result.imported} enregistrement(s) transféré(s), ${result.skipped} déjà présent(s) conservé(s), ${result.personalRecordsImported} historique(s)/préférence(s) ajouté(s). Les données locales restent intactes.`)
+    } catch (error) {
+      console.error('Le transfert des données locales a échoué.', error)
+      showNotice('Échec du transfert. Les données locales n’ont pas été supprimées ; vérifiez les droits Supabase et réessayez.')
+    } finally {
+      setLocalMigrationRunning(false)
     }
   }
 
-  function saveProfile(event: FormEvent<HTMLFormElement>) {
+  async function saveProfile(event: FormEvent<HTMLFormElement>) {
     event.preventDefault()
     const updated = { ...profileDraft, name: profileDraft.name.trim(), email: profileDraft.email.trim() }
     try {
+      if (isRemote) {
+        const { error } = await supabase!.auth.updateUser({
+          email: updated.email,
+          data: { display_name: updated.name },
+        })
+        if (error) throw error
+      }
       localStorage.setItem('agetip-profile', JSON.stringify(updated))
       setProfile(updated)
       setProfileDraft(updated)
       setProfileOpen(false)
-      showNotice('Le profil a été mis à jour sur cet appareil.')
+      showNotice(isRemote ? 'Le profil a été mis à jour.' : 'Le profil a été mis à jour sur cet appareil.')
     } catch (error) {
-      console.error('Impossible d’enregistrer le profil local.', error)
-      showNotice('Échec de la mise à jour du profil local.')
+      console.error('Impossible d’enregistrer le profil.', error)
+      showNotice('Échec de la mise à jour du profil. Vérifiez les informations saisies et vos droits.')
     }
   }
 
@@ -365,7 +574,55 @@ function App() {
     setRecordEditor({ module, collection, record: record ? { ...record } : defaults, originalReference: record?.reference })
   }
 
-  function saveOperationalRecord(event: FormEvent<HTMLFormElement>) {
+  async function saveImportedInvoices(candidates: InvoiceImportCandidate[]) {
+    try {
+      const rows = [...operationalRecords['Factures SONATEL']]
+      let added = 0
+      let updated = 0
+      const categoryCodes: Record<string, string> = { Fixe: 'FIX', Personnel: 'PER', Passerelle: 'PAS', Africatip: 'AFR' }
+
+      for (const candidate of candidates) {
+        const periodLabel = invoicePeriodLabel(candidate.period)
+        const designation = `Facture SONATEL — ${candidate.category} — ${periodLabel}`
+        const duplicateIndex = rows.findIndex(row =>
+          row.category === candidate.category &&
+          invoicePeriodKey(row.period, row.date) === candidate.period,
+        )
+        const importedFields: EditableRecord = {
+          reference: duplicateIndex >= 0 ? rows[duplicateIndex].reference : `SON-${candidate.period.replace('-', '')}-${categoryCodes[candidate.category]}`,
+          designation,
+          date: candidate.date || `${candidate.period}-01`,
+          period: periodLabel,
+          amount: String(Math.round(Number(candidate.amount))),
+          category: candidate.category,
+          status: 'À valider',
+          sourceFile: candidate.sourceFile,
+          sourceSheet: candidate.sourceSheet,
+        }
+
+        if (duplicateIndex >= 0) {
+          if (!candidate.replaceExisting) continue
+          rows[duplicateIndex] = importedFields
+          updated += 1
+        } else {
+          rows.unshift(importedFields)
+          added += 1
+        }
+      }
+
+      const next = { ...operationalRecords, 'Factures SONATEL': rows }
+      if (isRemote) await saveOperationalModuleToSupabase('Factures SONATEL', rows)
+      localStorage.setItem('agetip-operational-records', JSON.stringify(next))
+      setOperationalRecords(next)
+      setInvoiceImportOpen(false)
+      showNotice(`${added} facture(s) importée(s)${updated ? `, ${updated} mise(s) à jour` : ''}.`)
+    } catch (error) {
+      console.error('Impossible d’enregistrer les factures importées.', error)
+      showNotice('Échec de l’enregistrement des factures. Vérifiez votre rôle Supabase et réessayez.')
+    }
+  }
+
+  async function saveOperationalRecord(event: FormEvent<HTMLFormElement>) {
     event.preventDefault()
     if (!recordEditor) return
     const cleaned = Object.fromEntries(Object.entries(recordEditor.record).map(([key, value]) => [key, value.trim()])) as EditableRecord
@@ -382,53 +639,6 @@ function App() {
       return
     }
 
-    function saveImportedInvoices(candidates: InvoiceImportCandidate[]) {
-      try {
-        const rows = [...operationalRecords['Factures SONATEL']]
-        let added = 0
-        let updated = 0
-        const categoryCodes: Record<string, string> = { Fixe: 'FIX', Personnel: 'PER', Passerelle: 'PAS', Africatip: 'AFR' }
-
-        for (const candidate of candidates) {
-          const periodLabel = invoicePeriodLabel(candidate.period)
-          const designation = `Facture SONATEL — ${candidate.category} — ${periodLabel}`
-          const duplicateIndex = rows.findIndex(row =>
-            row.category === candidate.category &&
-            invoicePeriodKey(row.period, row.date) === candidate.period,
-          )
-          const importedFields: EditableRecord = {
-            reference: duplicateIndex >= 0 ? rows[duplicateIndex].reference : `SON-${candidate.period.replace('-', '')}-${categoryCodes[candidate.category]}`,
-            designation,
-            date: candidate.date || `${candidate.period}-01`,
-            period: periodLabel,
-            amount: String(Math.round(Number(candidate.amount))),
-            category: candidate.category,
-            status: 'À valider',
-            sourceFile: candidate.sourceFile,
-            sourceSheet: candidate.sourceSheet,
-          }
-
-          if (duplicateIndex >= 0) {
-            if (!candidate.replaceExisting) continue
-            rows[duplicateIndex] = importedFields
-            updated += 1
-          } else {
-            rows.unshift(importedFields)
-            added += 1
-          }
-        }
-
-        const next = { ...operationalRecords, 'Factures SONATEL': rows }
-        localStorage.setItem('agetip-operational-records', JSON.stringify(next))
-        setOperationalRecords(next)
-        setInvoiceImportOpen(false)
-        showNotice(`${added} facture(s) importée(s)${updated ? `, ${updated} mise(s) à jour` : ''}.`)
-      } catch (error) {
-        console.error('Impossible d’enregistrer les factures importées.', error)
-        showNotice('Échec de l’enregistrement des factures. Aucune modification n’a été conservée.')
-      }
-    }
-
     try {
       if (recordEditor.collection === 'movements') {
         const next = [...tonerMovements]
@@ -439,6 +649,7 @@ function App() {
         }
         if (index < 0) next.unshift(cleaned)
         else next[index] = cleaned
+        if (isRemote) await saveTonerMovementsToSupabase(next)
         localStorage.setItem('agetip-toner-movements', JSON.stringify(next))
         setTonerMovements(next)
       } else {
@@ -452,28 +663,51 @@ function App() {
         if (index < 0) rows.unshift(cleaned)
         else rows[index] = cleaned
         next[recordEditor.module] = rows
+        if (isRemote) await saveOperationalModuleToSupabase(recordEditor.module, rows)
         localStorage.setItem('agetip-operational-records', JSON.stringify(next))
         setOperationalRecords(next)
       }
       setRecordEditor(null)
-      showNotice(recordEditor.originalReference ? 'Les modifications ont été enregistrées dans ce navigateur.' : 'Le nouvel enregistrement a été ajouté dans ce navigateur.')
+      showNotice(recordEditor.originalReference ? 'Les modifications ont été enregistrées.' : 'Le nouvel enregistrement a été ajouté.')
     } catch (error) {
-      console.error('Impossible d’enregistrer les modifications locales.', error)
-      showNotice('Échec de l’enregistrement local. Vérifiez l’espace disponible dans le navigateur.')
+      console.error('Impossible d’enregistrer les modifications.', error)
+      showNotice('Échec de l’enregistrement. Vérifiez votre rôle Supabase et réessayez.')
     }
   }
 
-  function saveIncident(event: FormEvent<HTMLFormElement>) {
+  async function saveIncident(event: FormEvent<HTMLFormElement>) {
     event.preventDefault()
     if (!selectedIncident) return
     const exists = incidents.some(incident => incident.id === selectedIncident.id)
     const updated = exists
       ? incidents.map(incident => incident.id === selectedIncident.id ? selectedIncident : incident)
       : [selectedIncident, ...incidents]
-    setIncidents(updated)
-    localStorage.setItem('agetip-incidents', JSON.stringify(updated))
+    try {
+      if (isRemote) await saveIncidentsToSupabase(updated)
+      localStorage.setItem('agetip-incidents', JSON.stringify(updated))
+      setIncidents(updated)
+    } catch (error) {
+      console.error('Impossible d’enregistrer l’incident.', error)
+      showNotice('Échec de l’enregistrement de l’incident. Vérifiez votre rôle Supabase et réessayez.')
+      return
+    }
     setSelectedIncident(null)
     showNotice(exists ? 'La fiche d’incident a été mise à jour.' : 'La fiche d’incident a été enregistrée.')
+  }
+
+  async function deleteIncident() {
+    if (!selectedIncident) return
+    const updated = incidents.filter(item => item.id !== selectedIncident.id)
+    try {
+      if (isRemote) await saveIncidentsToSupabase(updated)
+      localStorage.setItem('agetip-incidents', JSON.stringify(updated))
+      setIncidents(updated)
+      setSelectedIncident(null)
+      showNotice('La fiche d’incident a été supprimée.')
+    } catch (error) {
+      console.error('Impossible de supprimer l’incident.', error)
+      showNotice('Échec de la suppression. Vérifiez votre rôle Supabase et réessayez.')
+    }
   }
 
   async function downloadReport() {
@@ -584,17 +818,59 @@ function App() {
       </tr>)}</tbody></table>{matching.length === 0 && <div className="empty-state">Aucun résultat.</div>}</div>
   }
 
-  function sendChat(event: FormEvent<HTMLFormElement>) {
+  async function sendChat(event: FormEvent<HTMLFormElement>) {
     event.preventDefault()
-    if (!chatInput.trim()) return
-    setChat(current => [...current, { role: 'user', text: chatInput.trim() }, { role: 'assistant', text: 'La recherche documentaire locale n’est pas encore connectée. Le déploiement final pourra utiliser Ollama et une base RAG interne afin de répondre à partir des procédures AGETIP, avec les références des documents consultés.' }])
+    const question = chatInput.trim()
+    if (!question || assistantLoading) return
+    const userMessage = { role: 'user' as const, text: question }
+    const pendingMessages = [...chat, userMessage]
+    setChat(pendingMessages)
     setChatInput('')
+    setAssistantLoading(true)
+    try {
+      let context = ''
+      let sources: string[] = []
+      if (isRemote) {
+        const documents = await loadReferenceDocuments()
+        const retrieval = await findDocumentContext(documents, question)
+        context = retrieval.context
+        sources = retrieval.sources
+      }
+
+      const answer = await askLocalAssistant(
+        pendingMessages.slice(-12).map(message => ({ role: message.role, content: message.text })),
+        context,
+        session?.access_token,
+      )
+      const completedMessages = [...pendingMessages, { role: 'assistant' as const, text: answer, sources }]
+      setChat(completedMessages)
+      try {
+        if (isRemote && session) {
+          await saveUserRecord('assistant_chat', session.user.id, { messages: completedMessages.slice(-40) })
+        } else {
+          localStorage.setItem('agetip-assistant-chat', JSON.stringify(completedMessages.slice(-40)))
+        }
+      } catch (error) {
+        console.error('La réponse est disponible, mais son historique n’a pas pu être enregistré.', error)
+        showNotice('Réponse reçue, mais historique non enregistré.')
+      }
+    } catch (error) {
+      console.error('La réponse de l’assistant local a échoué.', error)
+      showNotice(error instanceof Error ? error.message : 'Impossible de joindre Ollama. Vérifiez le serveur et son modèle.')
+      setChat(current => current.filter((message, index) => !(index === current.length - 1 && message === userMessage)))
+    } finally {
+      setAssistantLoading(false)
+    }
   }
 
   const now = new Date()
   const greetingDate = dateLabel(now)
   const isReport = section === 'Rapports'
-  const sectionTitle = section === 'Tableau de bord' ? 'Bonjour Administrateur' : section
+  const sectionTitle = section === 'Tableau de bord' ? `Bonjour ${profile.name.split(' ')[0]}` : section
+
+  if (isRemote && !dataReady) {
+    return <main className="auth-page"><section className="auth-card"><strong>AGETIP</strong><p>Chargement sécurisé des données depuis Supabase…</p></section></main>
+  }
 
   return <div className="app-shell">
     <aside className={`sidebar ${drawerOpen ? 'sidebar-open' : ''}`}>
@@ -622,14 +898,14 @@ function App() {
             {notificationsOpen && <>
               <button className="popover-scrim" onClick={() => setNotificationsOpen(false)} aria-label="Fermer les notifications"/>
               <section className="notification-panel" aria-label="Notifications">
-                <div className="notification-heading"><div><h2>Notifications</h2><span>{unreadCount ? `${unreadCount} nouvelle(s)` : 'Tout est à jour'}</span></div>{unreadCount > 0 && <button className="text-link" onClick={() => markNotificationsSeen(notifications.map(item => item.id))}><CheckCheck size={14}/>Tout lire</button>}</div>
+                <div className="notification-heading"><div><h2>Notifications</h2><span>{unreadCount ? `${unreadCount} nouvelle(s)` : 'Tout est à jour'}</span></div>{unreadCount > 0 && <button className="text-link" onClick={() => { void markNotificationsSeen(notifications.map(item => item.id)) }}><CheckCheck size={14}/>Tout lire</button>}</div>
                 <div className="notification-list">{notifications.length ? notifications.map(item => {
                   const isUnread = !seenNotifications.includes(item.id)
-                  return <button className={`notification-item ${isUnread ? 'unread' : ''}`} key={item.id} onClick={() => { markNotificationsSeen([item.id]); setSection(item.module); setNotificationsOpen(false) }}>
+                  return <button className={`notification-item ${isUnread ? 'unread' : ''}`} key={item.id} onClick={() => { void markNotificationsSeen([item.id]); setSection(item.module); setNotificationsOpen(false) }}>
                     <span className={`notification-symbol ${item.tone}`}><Bell size={14}/></span><span className="notification-copy"><strong>{item.title}</strong><small>{item.detail}</small></span>{isUnread && <span className="unread-indicator" aria-label="Non lue"/>}
                   </button>
                 }) : <div className="notification-empty"><Check size={18}/><strong>Aucune alerte opérationnelle</strong><span>Les alertes apparaîtront ici.</span></div>}</div>
-                <div className="notification-footer">Les alertes sont calculées à partir des données locales de démonstration.</div>
+                <div className="notification-footer">Les alertes sont calculées à partir des données enregistrées{isRemote ? ' dans Supabase.' : ' localement.'}</div>
               </section>
             </>}
           </div>
@@ -637,10 +913,11 @@ function App() {
         </div>
       </header>
       <div className="page-content">
-        <div className="page-heading"><div><h1>{sectionTitle}</h1>{section === 'Tableau de bord' ? <p>Situation au {greetingDate}.</p> : section === 'Incidents' ? <p>Enregistrez et suivez les signalements informatiques et techniques.</p> : null}</div>
+        <div className="page-heading"><div><h1>{sectionTitle}</h1>{section === 'Tableau de bord' ? <p>Situation au {greetingDate}.</p> : section === 'Incidents' ? <p>Enregistrez et suivez les signalements informatiques et techniques.</p> : section === 'Personnel' ? <p>Répertoire des collaborateurs et de leurs adresses e-mail AGETIP.</p> : null}</div>
           {section === 'Incidents' && <button className="button primary" onClick={() => setSelectedIncident(emptyIncident())}><Plus size={16}/>Nouvel incident</button>}
         </div>
         {section === 'Tableau de bord' && <Dashboard incidents={incidents} records={operationalRecords} invoiceCount={monthInvoices.length} invoiceTotal={monthInvoices.reduce((total, item) => total + (Number(item.amount) || 0), 0)} setSection={setSection} openIncident={setSelectedIncident} />}
+        {section === 'Personnel' && <PersonnelDirectory isRemote={isRemote} canManage={!isRemote || profile.jobTitle === 'Administrateur'} />}
         {section === 'Incidents' && <section className="panel module-panel">
           <div className="filter-row"><label className="search-box"><Search size={16}/><input value={incidentSearch} onChange={event => setIncidentSearch(event.target.value)} placeholder="Rechercher..." /></label>
             <label className="select-box"><Filter size={14}/><select value={incidentStatus} onChange={event => setIncidentStatus(event.target.value)}><option>Tous les statuts</option><option>Ouvert</option><option>Clôturé</option></select></label>
@@ -656,10 +933,11 @@ function App() {
               {section === 'Cartouches (stock)' && <button className="button light" onClick={() => showNotice('Import Excel indisponible dans ce prototype : aucune donnée n’a été modifiée.')}><Upload size={15}/>Importer</button>}
               <button className="button primary" onClick={() => openRecordEditor(section as ModuleName, undefined, section === 'Cartouches (stock)' && stockTab === 'Mouvements de cartouches' ? 'movements' : 'module')}><Plus size={15} />Nouveau</button>
             </div>
-          </div>{renderModuleTable()}<div className="table-footer">{(section === 'Cartouches (stock)' && stockTab === 'Mouvements de cartouches' ? tonerMovements : operationalRecords[section as ModuleName]).length} enregistrement(s) conservé(s) dans ce navigateur</div>
+          </div>{renderModuleTable()}<div className="table-footer">{(section === 'Cartouches (stock)' && stockTab === 'Mouvements de cartouches' ? tonerMovements : operationalRecords[section as ModuleName]).length} enregistrement(s){isRemote ? ' synchronisé(s) avec Supabase' : ' conservé(s) dans ce navigateur'}</div>
         </section>}
         {recordEditor && <OperationalRecordEditor editor={recordEditor} onChange={updatedEditor => setRecordEditor(updatedEditor)} onSave={saveOperationalRecord} onClose={() => setRecordEditor(null)} />}
         {isReport && <ReportsPanel
+          session={session} isRemote={isRemote} showNotice={showNotice}
           reportType={reportType} setReportType={setReportType} frequency={frequency} setFrequency={value => { setFrequency(value); setPreviewReady(false) }}
           referenceDate={referenceDate} setReferenceDate={value => { setReferenceDate(value); setPreviewReady(false) }}
           customStart={customStart} setCustomStart={value => { setCustomStart(value); setPreviewReady(false) }} customEnd={customEnd} setCustomEnd={value => { setCustomEnd(value); setPreviewReady(false) }}
@@ -668,20 +946,17 @@ function App() {
           reportFormat={reportFormat} setReportFormat={setReportFormat} reportPeriod={reportRangeLabel} reportIncidents={reportIncidents}
           reportData={reportData} reportAnalysis={reportAnalysis} onExport={downloadReport} onPrint={() => window.print()} />
         }
-        {section === 'Assistant IA' && <section className="panel assistant-panel"><div className="assistant-head"><div className="assistant-logo"><Sparkles size={21}/></div><div><h2>Assistant AGETIP</h2><p>Assistant documentaire local · RAG et Ollama</p></div><span className="status-pill"><span/>Mode démonstration</span></div>
-          <div className="chat-history">{chat.map((message, index) => <div key={index} className={`chat-message ${message.role}`}><div className="chat-avatar">{message.role === 'assistant' ? <Sparkles size={15}/> : 'AD'}</div><div className="chat-bubble">{message.text}{message.role === 'assistant' && index > 0 && <div className="source-note"><BookOpenText size={13}/> Sources documentaires : disponibles après configuration</div>}</div></div>)}</div>
-          <form className="chat-form" onSubmit={sendChat}><input value={chatInput} onChange={event => setChatInput(event.target.value)} placeholder="Posez une question sur les procédures ou les équipements…" /><button className="button primary" type="submit"><ArrowDownToLine className="send-icon" size={16}/>Envoyer</button></form>
-          <div className="assistant-note"><ShieldCheck size={15}/>Prototype : aucune donnée n’est envoyée à un fournisseur IA ; Ollama et l’index documentaire ne sont pas connectés.</div>
+        {section === 'Assistant IA' && <section className="panel assistant-panel"><div className="assistant-head"><div className="assistant-logo"><Sparkles size={21}/></div><div><h2>Assistant AGETIP</h2><p>Recherche documentaire locale · Ollama</p></div><span className="status-pill"><span/>{assistantStatus}</span></div>
+          <div className="chat-history">{chat.map((message, index) => <div key={index} className={`chat-message ${message.role}`}><div className="chat-avatar">{message.role === 'assistant' ? <Sparkles size={15}/> : 'AD'}</div><div className="chat-bubble">{message.text}{message.sources?.length ? <div className="source-note"><BookOpenText size={13}/> Sources : {message.sources.join(', ')}</div> : null}</div></div>)}{assistantLoading && <div className="chat-message assistant"><div className="chat-avatar"><Sparkles size={15}/></div><div className="chat-bubble">Ollama prépare une réponse…</div></div>}</div>
+          <form className="chat-form" onSubmit={event => { void sendChat(event) }}><input value={chatInput} onChange={event => setChatInput(event.target.value)} placeholder="Posez une question sur les procédures ou les équipements…" /><button className="button primary" disabled={assistantLoading || !chatInput.trim()} type="submit"><ArrowDownToLine className="send-icon" size={16}/>{assistantLoading ? 'Réponse…' : 'Envoyer'}</button></form>
+          <div className="assistant-note"><ShieldCheck size={15}/>Les messages et extraits documentaires sont transmis uniquement au serveur Ollama configuré. {isRemote ? 'L’historique est enregistré dans votre compte.' : 'L’historique reste dans ce navigateur.'}</div>
         </section>}
-        {section === 'Documents et outils' && <DocumentsPanel showNotice={showNotice} />}
-        {section === 'Paramètres' && <section className="panel settings-panel"><h2>Paramètres de l’espace</h2><p className="muted">Préférences et informations de configuration de la plateforme.</p><div className="settings-grid"><div className="setting-item"><strong>Organisation</strong><span>AGETIP</span></div><div className="setting-item"><strong>Langue</strong><span>Français</span></div><div className="setting-item"><strong>Stockage des incidents</strong><span>Navigateur local (prototype)</span></div><div className="setting-item"><strong>Assistant IA</strong><span>Ollama / RAG — à connecter</span></div></div><button className="button light" onClick={() => { localStorage.removeItem('agetip-incidents'); localStorage.removeItem('agetip-operational-records'); localStorage.removeItem('agetip-toner-movements'); setIncidents(initialIncidents); setOperationalRecords(initialOperationalRecords); setTonerMovements(initialTonerMovements); showNotice('Les données locales ont été restaurées depuis les exemples.') }}>Restaurer les données de démonstration</button></section>}
+        {section === 'Documents et outils' && <DocumentsPanel showNotice={showNotice} session={session} isRemote={isRemote} canManage={isRemote && ['Administrateur', 'Technicien'].includes(profile.jobTitle)} />}
+        {section === 'Paramètres' && <section className="panel settings-panel"><h2>Paramètres de l’espace</h2><p className="muted">Préférences et informations de configuration de la plateforme.</p><div className="settings-grid"><div className="setting-item"><strong>Organisation</strong><span>AGETIP</span></div><div className="setting-item"><strong>Langue</strong><span>Français</span></div><div className="setting-item"><strong>Stockage des incidents</strong><span>{isRemote ? 'Supabase (authentifié)' : 'Navigateur local / API locale'}</span></div><div className="setting-item"><strong>Assistant IA</strong><span>Ollama local · serveur à démarrer</span></div></div>{isRemote && profile.jobTitle === 'Administrateur' && <div><p className="muted">Transfert non destructif : seules les données locales absentes de Supabase sont ajoutées. Les données locales ne sont pas supprimées.</p><button className="button primary" disabled={localMigrationRunning} onClick={() => { void migrateLocalData() }}>{localMigrationRunning ? 'Transfert en cours…' : 'Transférer les données locales'}</button></div>}{isRemote && profile.jobTitle !== 'Administrateur' && <p className="muted">Le transfert des données locales est réservé aux administrateurs.</p>}{!isRemote && <button className="button light" onClick={() => { localStorage.removeItem('agetip-incidents'); localStorage.removeItem('agetip-operational-records'); localStorage.removeItem('agetip-toner-movements'); setIncidents(initialIncidents); setOperationalRecords(initialOperationalRecords); setTonerMovements(initialTonerMovements); showNotice('Les données locales ont été restaurées depuis les exemples.') }}>Restaurer les données de démonstration</button>}</section>}
       </div>
     </main>
     {invoiceImportOpen && <InvoiceImportDialog existingRecords={operationalRecords['Factures SONATEL']} onClose={() => setInvoiceImportOpen(false)} onConfirm={saveImportedInvoices} />}
-    {selectedIncident && <IncidentDrawer incident={selectedIncident} devices={operationalRecords['Parc informatique']} airConditioners={operationalRecords.Climatisation} isExisting={incidents.some(item => item.id === selectedIncident.id)} setIncident={setSelectedIncident} onClose={() => setSelectedIncident(null)} onSave={saveIncident} onDelete={() => {
-      const updated = incidents.filter(item => item.id !== selectedIncident.id)
-      setIncidents(updated); localStorage.setItem('agetip-incidents', JSON.stringify(updated)); setSelectedIncident(null); showNotice('La fiche d’incident a été supprimée.')
-    }} onPrint={() => { try { printIncidentSheet(selectedIncident) } catch (error) { console.error(error); showNotice('Impossible d’ouvrir la fenêtre d’impression.') } }} onWord={async () => { try { const { exportIncidentWord } = await import('./reportExports'); await exportIncidentWord(selectedIncident); showNotice('La fiche officielle d’incident Word a été générée.') } catch (error) { console.error(error); showNotice('Impossible de générer le document Word officiel.') } }} />}
+    {selectedIncident && <IncidentDrawer incident={selectedIncident} devices={operationalRecords['Parc informatique']} airConditioners={operationalRecords.Climatisation} isExisting={incidents.some(item => item.id === selectedIncident.id)} setIncident={setSelectedIncident} onClose={() => setSelectedIncident(null)} onSave={saveIncident} onDelete={() => { void deleteIncident() }} onPrint={() => { try { printIncidentSheet(selectedIncident) } catch (error) { console.error(error); showNotice('Impossible d’ouvrir la fenêtre d’impression.') } }} onWord={async () => { try { const { exportIncidentWord } = await import('./reportExports'); await exportIncidentWord(selectedIncident); showNotice('La fiche officielle d’incident Word a été générée.') } catch (error) { console.error(error); showNotice('Impossible de générer le document Word officiel.') } }} />}
     {profileOpen && <div className="modal-overlay" onMouseDown={event => { if (event.target === event.currentTarget) { setProfileOpen(false); setLogoutConfirm(false) } }}>
       <section className="profile-modal" role="dialog" aria-modal="true" aria-labelledby="profile-title">
         <div className="profile-modal-heading"><div className="profile-modal-avatar">{initials(profile.name)}</div><div><h2 id="profile-title">Mon profil</h2><p>Informations de votre compte AGETIP</p></div><button className="icon-button" onClick={() => { setProfileOpen(false); setLogoutConfirm(false) }} aria-label="Fermer le profil"><X size={18}/></button></div>
@@ -689,9 +964,9 @@ function App() {
           <label className="field-label">Nom et prénom<input required maxLength={80} value={profileDraft.name} onChange={event => setProfileDraft({ ...profileDraft, name: event.target.value })}/></label>
           <label className="field-label">Adresse e-mail<input type="email" required maxLength={120} value={profileDraft.email} onChange={event => setProfileDraft({ ...profileDraft, email: event.target.value })}/></label>
           <div className="profile-readonly"><span>Fonction</span><strong>{profile.jobTitle}</strong></div>
-          <div className="profile-security"><ShieldCheck size={16}/><span>Les informations du profil sont conservées localement dans ce prototype. La gestion des comptes sera raccordée à Supabase Auth.</span></div>
+          <div className="profile-security"><ShieldCheck size={16}/><span>{isRemote ? `Compte Supabase authentifié · rôle : ${profile.jobTitle}.` : 'Les informations du profil sont conservées localement dans ce prototype.'}</span></div>
           <div className="profile-modal-actions"><button type="button" className="button light" onClick={() => { setProfileOpen(false); setSection('Paramètres') }}>Paramètres</button><div/><button type="button" className="button danger-outline" onClick={() => setLogoutConfirm(true)}><LogOut size={14}/>Déconnexion</button><button type="submit" className="button primary"><Check size={14}/>Enregistrer</button></div>
-        </form> : <div className="logout-confirm"><div className="logout-icon"><LogOut size={20}/></div><h3>Se déconnecter ?</h3><p>La déconnexion réelle sera disponible une fois l’authentification AGETIP configurée. Voulez-vous fermer cette session de démonstration ?</p><div className="profile-modal-actions"><button className="button light" onClick={() => setLogoutConfirm(false)}>Annuler</button><div/><button className="button danger-outline" onClick={() => { setProfileOpen(false); setLogoutConfirm(false); showNotice('Session de démonstration fermée. L’authentification réelle n’est pas encore activée.') }}><LogOut size={14}/>Confirmer</button></div></div>}
+        </form> : <div className="logout-confirm"><div className="logout-icon"><LogOut size={20}/></div><h3>Se déconnecter ?</h3><p>{isRemote ? 'Vous serez déconnecté de votre compte AGETIP.' : 'Voulez-vous fermer cette session de démonstration ?'}</p><div className="profile-modal-actions"><button className="button light" onClick={() => setLogoutConfirm(false)}>Annuler</button><div/><button className="button danger-outline" onClick={async () => { if (isRemote) { const { error } = await supabase!.auth.signOut(); if (error) { console.error('Échec de la déconnexion Supabase.', error); showNotice('Impossible de vous déconnecter. Réessayez.'); return } } setProfileOpen(false); setLogoutConfirm(false); if (!isRemote) showNotice('Session de démonstration fermée.') }}><LogOut size={14}/>Confirmer</button></div></div>}
       </section>
     </div>}
     {notice && <div className="toast" role="status"><Check size={16}/>{notice}<button className="icon-button" onClick={() => setNotice('')} aria-label="Fermer"><X size={15}/></button></div>}
@@ -765,6 +1040,7 @@ function OperationalRecordEditor({ editor, onChange, onSave, onClose }: {
 }
 
 function ReportsPanel(props: {
+  session: Session | null; isRemote: boolean; showNotice: (message: string) => void
   reportType: ReportType; setReportType: (value: ReportType) => void; frequency: Frequency; setFrequency: (value: Frequency) => void
   referenceDate: string; setReferenceDate: (value: string) => void; customStart: string; setCustomStart: (value: string) => void
   customEnd: string; setCustomEnd: (value: string) => void; chosenModules: ModuleName[]; setChosenModules: (value: ModuleName[]) => void
@@ -781,17 +1057,42 @@ function ReportsPanel(props: {
       return []
     }
   })
+  useEffect(() => {
+    if (!props.isRemote || !props.session) return
+    let active = true
+    void loadUserRecord<{ entries?: string[] }>('report_history', props.session.user.id)
+      .then(record => {
+        if (active && Array.isArray(record?.entries)) setHistory(record.entries)
+      })
+      .catch(error => {
+        console.error('Impossible de charger l’historique des rapports.', error)
+        if (active) props.showNotice('Impossible de charger l’historique des rapports.')
+      })
+    return () => { active = false }
+  }, [props.isRemote, props.session?.user.id])
   const formats: ReportFormat[] = ['PDF', 'Word (.docx)', 'Excel (.xlsx)', 'PowerPoint (.pptx)', 'Image PNG', 'Image JPG']
   const toggleModule = (name: ModuleName) => props.setChosenModules(props.chosenModules.includes(name) ? props.chosenModules.filter(item => item !== name) : [...props.chosenModules, name])
   const sectionOptions: ReportSection[] = ['Indicateurs clés', 'Graphiques', 'Répartitions détaillées', 'Détail des enregistrements', 'Conclusions']
   const toggleSection = (name: ReportSection) => props.setIncludedSections(props.includedSections.includes(name) ? props.includedSections.filter(item => item !== name) : [...props.includedSections, name])
-  function preparePreview() {
+  async function preparePreview() {
     if (!props.validReportPeriod) return
     props.setPreviewReady(true)
     const entry = `${props.reportType} · ${props.reportPeriod} · ${new Date().toLocaleDateString('fr-FR')}`
     const nextHistory = [entry, ...history].slice(0, 10)
     setHistory(nextHistory)
-    localStorage.setItem('agetip-report-history', JSON.stringify(nextHistory))
+    try {
+      localStorage.setItem('agetip-report-history', JSON.stringify(nextHistory))
+    } catch (error) {
+      console.error('Impossible d’enregistrer l’historique local des rapports.', error)
+    }
+    if (props.isRemote && props.session) {
+      try {
+        await saveUserRecord('report_history', props.session.user.id, { entries: nextHistory })
+      } catch (error) {
+        console.error('Impossible d’enregistrer l’historique Supabase des rapports.', error)
+        props.showNotice('Aperçu généré, mais son historique n’a pas pu être synchronisé.')
+      }
+    }
   }
   const periodTitle = props.frequency === 'Mensuel' ? new Date(`${props.referenceDate}T12:00:00`).toLocaleDateString('fr-FR', { month: 'long', year: 'numeric' }) : props.reportPeriod
   return <div className="reports-layout">
@@ -812,7 +1113,7 @@ function ReportsPanel(props: {
       <div className="form-step"><label className="step-label"><span>5</span>Format d’export</label><div className="format-options">{formats.map(format => <button key={format} onClick={() => props.setReportFormat(format)} className={`format-chip ${props.reportFormat === format ? 'selected' : ''}`}>{format}</button>)}</div>
         <div className="export-actions"><button className="button primary" disabled={!props.previewReady} onClick={props.onExport}><ArrowDownToLine size={15}/>Télécharger</button><button className="button light" disabled={!props.previewReady} onClick={props.onPrint}><Printer size={15}/>Imprimer</button></div>
       </div>
-      {history.length > 0 && <div className="report-history"><strong>Aperçus consultés récemment</strong><p className="history-note">Historique conservé sur cet appareil ; les fichiers ne sont pas archivés.</p>{history.slice(0, 3).map((entry, index) => <div className="history-entry" key={`${entry}-${index}`}><FileText size={14}/><span>{entry}</span></div>)}</div>}
+      {history.length > 0 && <div className="report-history"><strong>Aperçus consultés récemment</strong><p className="history-note">{props.isRemote ? 'Historique synchronisé avec votre compte ; les fichiers ne sont pas archivés.' : 'Historique conservé sur cet appareil ; les fichiers ne sont pas archivés.'}</p>{history.slice(0, 3).map((entry, index) => <div className="history-entry" key={`${entry}-${index}`}><FileText size={14}/><span>{entry}</span></div>)}</div>}
     </section>
     <section id="report-preview" className="panel report-preview">
       <div className="report-brand">AGETIP <span>· INFORMATIQUE & TECHNIQUE</span></div><h2>{props.reportType}</h2><p className="report-period"><strong>Période couverte :</strong> {periodTitle} <span>·</span> Généré le {new Date().toLocaleDateString('fr-FR')}</p><p className="report-data-note">Données de démonstration — ne pas utiliser comme rapport opérationnel.</p>
@@ -865,17 +1166,181 @@ function IncidentDrawer({ incident, devices, airConditioners, isExisting, setInc
   </aside></div>
 }
 
-function DocumentsPanel({ showNotice }: { showNotice: (message: string) => void }) {
-  const [files, setFiles] = useState<{ name: string; size: string; type: string }[]>([])
-  return <div className="documents-layout"><section className="panel document-panel"><div className="panel-heading"><div><h2>Documents de référence</h2><p className="muted">Procédures et manuels disponibles pour l’assistant documentaire local.</p></div><button className="button primary" onClick={() => document.getElementById('document-upload')?.click()}><CloudUpload size={16}/>Ajouter des documents</button><input id="document-upload" type="file" className="visually-hidden" multiple accept=".pdf,.docx,.doc,.txt" onChange={event => {
+function DocumentsPanel({ showNotice, session, isRemote, canManage }: {
+  showNotice: (message: string) => void
+  session: Session | null
+  isRemote: boolean
+  canManage: boolean
+}) {
+  const [files, setFiles] = useState<ReferenceDocument[]>([])
+  const [busy, setBusy] = useState(false)
+
+  useEffect(() => {
+    if (!isRemote) return
+    let active = true
+    void loadReferenceDocuments().then(documents => {
+      if (active) setFiles(documents)
+    }).catch(error => {
+      console.error('Impossible de charger les documents de référence.', error)
+      if (active) showNotice('Impossible de charger les documents Supabase.')
+    })
+    return () => { active = false }
+  }, [isRemote])
+
+  async function addFiles(event: ChangeEvent<HTMLInputElement>) {
     const selected = Array.from(event.target.files ?? [])
-    setFiles(current => [...current, ...selected.map(file => ({ name: file.name, size: `${(file.size / 1024).toFixed(0)} Ko`, type: file.name.split('.').pop()?.toUpperCase() ?? 'FICHIER' }))])
-    if (selected.length) showNotice(`${selected.length} document(s) ajouté(s) à la file de prévisualisation.`)
     event.target.value = ''
-  }}/></div>
-    <div className="upload-drop"><CloudUpload size={26}/><strong>Déposez ici vos documents de référence</strong><span>PDF, Word ou texte — les fichiers seront indexés par le service documentaire lors du déploiement.</span><button className="button light" onClick={() => document.getElementById('document-upload')?.click()}><Upload size={15}/>Parcourir les fichiers</button></div>
-    <div className="document-list"><div className="document-list-heading"><strong>{files.length ? 'Documents ajoutés' : 'Aucun document ajouté'}</strong><span>{files.length} fichier(s)</span></div>{files.map((file, index) => <div className="file-row" key={`${file.name}-${index}`}><FileText size={18}/><strong>{file.name}</strong><span>{file.type}</span><small>{file.size}</small><button className="icon-button" onClick={() => setFiles(current => current.filter((_, item) => item !== index))} aria-label="Supprimer"><X size={15}/></button></div>)}</div>
-  </section><aside className="panel integration-panel"><div className="assistant-logo"><Sparkles size={20}/></div><h2>Base documentaire locale</h2><p>Le service RAG utilisera les documents autorisés pour fournir des réponses sourcées en français.</p><div className="integration-line"><span>Modèle</span><strong>Ollama (local)</strong></div><div className="integration-line"><span>Confidentialité</span><strong><ShieldCheck size={14}/> Hébergement local</strong></div><div className="integration-line"><span>API payante</span><strong>Non requise</strong></div><button className="button light full-button" onClick={() => showNotice('L’intégration Ollama sera configurée sur le serveur AGETIP.')}>Configurer Ollama</button></aside></div>
+    if (!selected.length) return
+    if (!isRemote || !session) {
+      showNotice('Connectez-vous à Supabase pour stocker les documents de façon persistante.')
+      return
+    }
+    if (!canManage) {
+      showNotice('Seuls les administrateurs et techniciens peuvent ajouter des documents.')
+      return
+    }
+
+    setBusy(true)
+    let added = 0
+    let indexed = 0
+    try {
+      for (const file of selected) {
+        let extractedText: string | undefined
+        try {
+          extractedText = await extractReferenceText(file)
+        } catch (error) {
+          console.warn(`Le document ${file.name} sera stocké sans index de texte.`, error)
+        }
+        const document = await uploadReferenceDocument(file, session.user.id, extractedText)
+        setFiles(current => [document, ...current])
+        added += 1
+        if (extractedText) indexed += 1
+      }
+      showNotice(`${added} document(s) ajouté(s), ${indexed} indexé(s) pour l’assistant.`)
+    } catch (error) {
+      console.error('Impossible de charger un document de référence.', error)
+      showNotice(error instanceof Error ? error.message : 'Échec de l’ajout des documents.')
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  async function openDocument(file: ReferenceDocument) {
+    if (!supabase) return
+    const { data, error } = await supabase.storage.from('agetip-documents').createSignedUrl(file.path, 60)
+    if (error) {
+      console.error('Impossible de générer le lien sécurisé du document.', error)
+      showNotice('Impossible d’ouvrir ce document.')
+      return
+    }
+    window.open(data.signedUrl, '_blank', 'noopener,noreferrer')
+  }
+
+  async function removeDocument(file: ReferenceDocument) {
+    try {
+      await deleteReferenceDocument(file)
+      setFiles(current => current.filter(document => document.path !== file.path))
+      showNotice('Document supprimé.')
+    } catch (error) {
+      console.error('Impossible de supprimer le document.', error)
+      showNotice('Échec de la suppression. Vérifiez vos droits et réessayez.')
+    }
+  }
+
+  return <div className="documents-layout"><section className="panel document-panel"><div className="panel-heading"><div><h2>Documents de référence</h2><p className="muted">{isRemote ? 'Fichiers privés partagés avec les utilisateurs authentifiés et indexés localement pour l’assistant.' : 'Connectez Supabase pour stocker les documents et les rendre disponibles à l’assistant.'}</p></div>{canManage && <button className="button primary" disabled={busy} onClick={() => document.getElementById('document-upload')?.click()}><CloudUpload size={16}/>{busy ? 'Chargement…' : 'Ajouter des documents'}</button>}<input id="document-upload" type="file" className="visually-hidden" multiple accept=".pdf,.docx,.doc,.txt" onChange={event => { void addFiles(event) }}/></div>
+    <div className="upload-drop"><CloudUpload size={26}/><strong>Déposez ici vos documents de référence</strong><span>PDF, Word ou texte. Taille maximale : 20 Mo par fichier. Les documents numérisés sans texte ne pourront pas être interrogés.</span>{canManage && <button className="button light" disabled={busy} onClick={() => document.getElementById('document-upload')?.click()}><Upload size={15}/>Parcourir les fichiers</button>}</div>
+    <div className="document-list"><div className="document-list-heading"><strong>{files.length ? 'Documents ajoutés' : 'Aucun document ajouté'}</strong><span>{files.length} fichier(s)</span></div>{files.map(file => <div className="file-row" key={file.path}><FileText size={18}/><strong>{file.name}</strong><span>{file.type.split('/').pop()?.toUpperCase() ?? 'FICHIER'}</span><small>{file.textPath ? 'Indexé' : 'Non indexé'} · {(file.size / 1024).toFixed(0)} Ko</small><button className="icon-button" onClick={() => { void openDocument(file) }} aria-label="Ouvrir le document"><BookOpenText size={15}/></button>{canManage && <button className="icon-button" onClick={() => { void removeDocument(file) }} aria-label="Supprimer"><X size={15}/></button>}</div>)}</div>
+  </section><aside className="panel integration-panel"><div className="assistant-logo"><Sparkles size={20}/></div><h2>Base documentaire et assistant local</h2><p>{isRemote ? 'Les documents sont stockés dans un bucket Supabase privé. Leur texte est recherché par mots-clés dans le navigateur, puis transmis au serveur Ollama configuré localement.' : 'Configurez Supabase pour stocker les documents. Le texte extrait sera transmis au serveur Ollama local.'}</p><div className="integration-line"><span>Modèle</span><strong>Ollama local</strong></div><div className="integration-line"><span>Fichiers</span><strong>{isRemote ? 'Supabase privé' : 'Non configurés'}</strong></div><div className="integration-line"><span>Formats</span><strong>PDF, Word, texte</strong></div><p className="muted">Le serveur backend et le modèle Ollama doivent être démarrés sur une machine accessible aux utilisateurs.</p></aside></div>
+}
+
+function App() {
+  const [session, setSession] = useState<Session | null>(null)
+  const [authLoading, setAuthLoading] = useState(Boolean(supabase))
+
+  useEffect(() => {
+    if (!supabase) return
+    let active = true
+    void supabase.auth.getSession().then(({ data, error }) => {
+      if (!active) return
+      if (error) console.error('Impossible de restaurer la session Supabase.', error)
+      setSession(data.session)
+      setAuthLoading(false)
+    })
+    const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, nextSession) => {
+      setSession(nextSession)
+      setAuthLoading(false)
+    })
+    return () => {
+      active = false
+      subscription.unsubscribe()
+    }
+  }, [])
+
+  if (!supabase) return <Workspace session={null}/>
+  if (authLoading) return <main className="auth-page"><section className="auth-card"><strong>AGETIP</strong><p>Vérification de la session sécurisée…</p></section></main>
+  if (!session) return <AuthPage/>
+  return <Workspace session={session}/>
+}
+
+function AuthPage() {
+  const [mode, setMode] = useState<'sign-in' | 'sign-up'>('sign-in')
+  const [displayName, setDisplayName] = useState('')
+  const [email, setEmail] = useState('')
+  const [password, setPassword] = useState('')
+  const [message, setMessage] = useState('')
+  const [error, setError] = useState('')
+  const [submitting, setSubmitting] = useState(false)
+
+  async function submit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault()
+    if (!supabase) return
+    setError('')
+    setMessage('')
+    setSubmitting(true)
+    try {
+      if (mode === 'sign-up') {
+        const { data, error: signUpError } = await supabase.auth.signUp({
+          email: email.trim(),
+          password,
+          options: { data: { display_name: displayName.trim() } },
+        })
+        if (signUpError) throw signUpError
+        if (!data.session) {
+          setMessage('Compte créé. Confirmez votre adresse e-mail, puis connectez-vous.')
+        } else {
+          setMessage('Compte créé. Votre rôle initial est « Lecture seule » jusqu’à validation par un administrateur.')
+        }
+      } else {
+        const { error: signInError } = await supabase.auth.signInWithPassword({ email: email.trim(), password })
+        if (signInError) throw signInError
+      }
+    } catch (submitError) {
+      console.error('Échec de l’authentification Supabase.', submitError)
+      setError(submitError instanceof Error ? submitError.message : 'Échec de l’authentification.')
+    } finally {
+      setSubmitting(false)
+    }
+  }
+
+  return <main className="auth-page">
+    <section className="auth-card">
+      <div className="auth-brand"><img src="/assets/logo-agetip.png" alt="Logo AGETIP"/><div><strong>AGETIP</strong><span>Informatique & technique</span></div></div>
+      <h1>{mode === 'sign-in' ? 'Connexion sécurisée' : 'Créer un compte'}</h1>
+      <p>Connectez-vous pour accéder aux données opérationnelles partagées.</p>
+      <form className="auth-form" onSubmit={submit}>
+        {mode === 'sign-up' && <label className="field-label">Nom et prénom<input autoComplete="name" required maxLength={80} value={displayName} onChange={event => setDisplayName(event.target.value)}/></label>}
+        <label className="field-label">Adresse e-mail<input type="email" autoComplete="email" required value={email} onChange={event => setEmail(event.target.value)}/></label>
+        <label className="field-label">Mot de passe<input type="password" autoComplete={mode === 'sign-in' ? 'current-password' : 'new-password'} required minLength={8} value={password} onChange={event => setPassword(event.target.value)}/></label>
+        {error && <p className="auth-error" role="alert">{error}</p>}
+        {message && <p className="auth-message" role="status">{message}</p>}
+        <button className="button primary full-button" type="submit" disabled={submitting}>{submitting ? 'Patientez…' : mode === 'sign-in' ? 'Se connecter' : 'Créer mon compte'}</button>
+      </form>
+      <button className="text-link auth-toggle" onClick={() => { setMode(mode === 'sign-in' ? 'sign-up' : 'sign-in'); setError(''); setMessage('') }}>
+        {mode === 'sign-in' ? 'Créer un nouveau compte' : 'J’ai déjà un compte'}
+      </button>
+      <p className="auth-role-note">Les nouveaux comptes reçoivent le rôle « Lecture seule ». Un administrateur doit autoriser les modifications.</p>
+    </section>
+  </main>
 }
 
 export default App

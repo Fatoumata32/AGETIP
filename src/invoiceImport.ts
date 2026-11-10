@@ -90,10 +90,10 @@ function findCellAmount(rows: unknown[][], matcher: (label: string, row: unknown
 
 function categoryTotals(rows: unknown[][]): Array<{ category: InvoiceCategory; amount: string; label: string }> {
   const definitions: Array<{ category: InvoiceCategory; matcher: (label: string, row: unknown[]) => boolean }> = [
-    { category: 'Personnel', matcher: (label, row) => /total\s+personnel/.test(normalize(textValue(row[0]))) || normalize(textValue(row[1])) === 'personnel' },
+    { category: 'Personnel', matcher: (_label, row) => /total\s+personnel/.test(normalize(textValue(row[0]))) || normalize(textValue(row[1])) === 'personnel' },
     { category: 'Passerelle', matcher: (_label, row) => ['passerelle', 'passerelles'].includes(normalize(textValue(row[1]))) },
     { category: 'Africatip', matcher: (_label, row) => normalize(textValue(row[0])) === 'africatip' || normalize(textValue(row[1])) === 'africatip' },
-    { category: 'Fixe', matcher: (label, row) => /total\s+fixe/.test(normalize(textValue(row[0]))) || normalize(textValue(row[1])) === 'fixe' },
+    { category: 'Fixe', matcher: (_label, row) => /total\s+fixe/.test(normalize(textValue(row[0]))) || normalize(textValue(row[1])) === 'fixe' },
   ]
 
   return definitions.flatMap(({ category, matcher }) => {
@@ -144,7 +144,7 @@ function spreadsheetCandidates(fileName: string, workbook: {
     const headerText = rows.slice(0, 8).flat().map(textValue).join(' ')
     const headerPeriodValue = headerPeriod(rows)
     const headerPeriodTextValue = parseInvoicePeriod(headerText)
-    const headerPeriodIsInconsistent = headerPeriodValue && headerPeriodTextValue && headerPeriodValue !== headerPeriodTextValue
+    const headerPeriodIsInconsistent = Boolean(headerPeriodValue && headerPeriodTextValue && headerPeriodValue !== headerPeriodTextValue)
     const period = sheetPeriod || headerPeriodValue
     if (!period) {
       warnings.push(`Onglet « ${sheetName} » ignoré : mois et année introuvables dans son nom ou son en-tête.`)
@@ -191,15 +191,17 @@ declare global {
 let officeParserReady: Promise<BrowserOfficeParser> | undefined
 
 function loadOfficeParser(): Promise<BrowserOfficeParser> {
-  if (window.officeParser?.parseOffice) return Promise.resolve(window.officeParser)
+  const loadedParser = window.officeParser
+  if (loadedParser?.parseOffice) return Promise.resolve(loadedParser)
   if (officeParserReady) return officeParserReady
 
-  officeParserReady = new Promise((resolve, reject) => {
+  const loading = new Promise<BrowserOfficeParser>((resolve, reject) => {
     const script = document.createElement('script')
-    script.src = officeParserBundleUrl
+    script.src = import.meta.env.DEV ? '/__docstream/officeparser.browser.js' : officeParserBundleUrl
     script.async = true
     script.onload = () => {
-      if (window.officeParser?.parseOffice) resolve(window.officeParser)
+      const parser = window.officeParser
+      if (parser?.parseOffice) resolve(parser)
       else reject(new Error('Le module de lecture Word s’est chargé sans exposer son API navigateur.'))
     }
     script.onerror = () => reject(new Error('Le module de lecture Word n’a pas pu être chargé.'))
@@ -208,7 +210,8 @@ function loadOfficeParser(): Promise<BrowserOfficeParser> {
     officeParserReady = undefined
     throw error
   })
-  return officeParserReady
+  officeParserReady = loading
+  return loading
 }
 
 async function wordCandidate(file: File): Promise<InvoiceImportResult> {
@@ -233,6 +236,12 @@ async function wordCandidate(file: File): Promise<InvoiceImportResult> {
       ...(!wordAmount(text) ? [`${file.name} : aucun montant lisible n’a été trouvé ; saisissez-le dans l’aperçu.`] : []),
     ],
   }
+}
+
+export async function extractOfficeText(file: File) {
+  const parser = await loadOfficeParser()
+  const ast = await parser.parseOffice(await file.arrayBuffer())
+  return ast.toText()
 }
 
 export async function parseInvoiceFile(file: File): Promise<InvoiceImportResult> {
